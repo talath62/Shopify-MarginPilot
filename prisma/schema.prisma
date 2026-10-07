@@ -14,21 +14,524 @@ datasource db {
 }
 
 model Session {
-  id            String    @id
-  shop          String
-  state         String
-  isOnline      Boolean   @default(false)
-  scope         String?
-  expires       DateTime?
-  accessToken   String
-  userId        BigInt?
-  firstName     String?
-  lastName      String?
-  email         String?
-  accountOwner  Boolean   @default(false)
-  locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
+}
+
+// ---------------------------------------------------------------------------
+// PG-001 — Core Shopify data model. Source of truth: docs/PG-000-shopify-data-contract.md
+// Conventions (see docs/PG-001-data-model.md):
+// - Internal ids are UUIDs; Shopify GIDs are stored verbatim and never used as PK.
+// - Every row carries shopId. Required parent relations use composite FKs
+//   (shopId, parentId) -> (shopId, id) so a child cannot point to another shop's parent.
+// - Money: Decimal(20, 6), shopMoney only, with an explicit currency per row.
+//   Rates: Decimal(30, 15). No Float anywhere.
+// - Shopify enums are stored as String (Shopify adds values over time).
+// - Unknown values are NULL, never 0.
+// ---------------------------------------------------------------------------
+
+/// Provenance of a cost value (PG-000 §4.2, D7).
+/// SHOPIFY_UNIT_COST and MANUAL are "verified", ESTIMATED is "estimated", MISSING is "missing".
+enum CostSource {
+  SHOPIFY_UNIT_COST
+  MANUAL
+  ESTIMATED
+  MISSING
+}
+
+/// Business tenant. Distinct from Session: credentials stay in Session.
+model Shop {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopifyGid        String    @unique
+  myshopifyDomain   String    @unique
+  name              String
+  primaryDomainHost String?
+  /// Current shop currency. Every amount also stores its own currency.
+  currencyCode      String
+  ianaTimezone      String
+  /// Current shop setting. Use Order.taxesIncluded for an order.
+  taxesIncluded     Boolean
+  isActive          Boolean   @default(true)
+  installedAt       DateTime  @db.Timestamptz(3)
+  uninstalledAt     DateTime? @db.Timestamptz(3)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime  @updatedAt @db.Timestamptz(3)
+
+  products                     Product[]
+  productVariants              ProductVariant[]
+  inventoryItems               InventoryItem[]
+  orders                       Order[]
+  orderLines                   OrderLine[]
+  orderLineDiscountAllocations OrderLineDiscountAllocation[]
+  orderLineTaxes               OrderLineTax[]
+  shippingLines                ShippingLine[]
+  shippingLineTaxes            ShippingLineTax[]
+  orderTransactions            OrderTransaction[]
+  transactionFees              TransactionFee[]
+  refunds                      Refund[]
+  refundLines                  RefundLine[]
+  refundShippingLines          RefundShippingLine[]
+  refundOrderAdjustments       RefundOrderAdjustment[]
+  orderLineCostSnapshots       OrderLineCostSnapshot[]
+}
+
+model Product {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId           String    @db.Uuid
+  shopifyGid       String
+  title            String
+  /// Shopify ProductStatus (ACTIVE, ARCHIVED, DRAFT, UNLISTED at 2026-10).
+  status           String
+  shopifyCreatedAt DateTime  @db.Timestamptz(3)
+  shopifyUpdatedAt DateTime  @db.Timestamptz(3)
+  /// Soft delete (products/delete). Rows are never hard-deleted while referenced.
+  deletedAt        DateTime? @db.Timestamptz(3)
+  createdAt        DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime  @updatedAt @db.Timestamptz(3)
+
+  shop       Shop             @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  variants   ProductVariant[]
+  orderLines OrderLine[]
+
+  @@unique([shopId, shopifyGid])
+  @@unique([shopId, id])
+  @@index([shopId, shopifyUpdatedAt])
+}
+
+model ProductVariant {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId            String    @db.Uuid
+  productId         String    @db.Uuid
+  inventoryItemId   String    @db.Uuid
+  shopifyGid        String
+  title             String
+  /// Display only. Never an identifier.
+  sku               String?
+  /// Current price. The sold price lives on OrderLine.
+  price             Decimal   @db.Decimal(20, 6)
+  priceCurrencyCode String
+  deletedAt         DateTime? @db.Timestamptz(3)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime  @updatedAt @db.Timestamptz(3)
+
+  shop          Shop          @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  product       Product       @relation(fields: [shopId, productId], references: [shopId, id], onDelete: Cascade)
+  inventoryItem InventoryItem @relation(fields: [shopId, inventoryItemId], references: [shopId, id], onDelete: NoAction)
+  orderLines    OrderLine[]
+
+  @@unique([shopId, shopifyGid])
+  @@unique([shopId, id])
+  @@index([productId])
+  @@index([inventoryItemId])
+}
+
+/// Holds the CURRENT unit cost only. Never copied back into OrderLineCostSnapshot.
+model InventoryItem {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId               String   @db.Uuid
+  shopifyGid           String
+  /// NULL = cost unknown. Never defaulted to 0.
+  unitCost             Decimal? @db.Decimal(20, 6)
+  unitCostCurrencyCode String?
+  shopifyUpdatedAt     DateTime @db.Timestamptz(3)
+  createdAt            DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt            DateTime @updatedAt @db.Timestamptz(3)
+
+  shop     Shop             @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  variants ProductVariant[]
+
+  @@unique([shopId, shopifyGid])
+  @@unique([shopId, id])
+}
+
+/// Source data only: no profit is computed or stored here.
+/// All amounts are shopMoney in Order.currencyCode.
+model Order {
+  id                       String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId                   String    @db.Uuid
+  shopifyGid               String
+  name                     String
+  number                   Int
+  shopifyCreatedAt         DateTime  @db.Timestamptz(3)
+  shopifyUpdatedAt         DateTime  @db.Timestamptz(3)
+  /// Accounting date of the sale (D2).
+  processedAt              DateTime  @db.Timestamptz(3)
+  cancelledAt              DateTime? @db.Timestamptz(3)
+  cancelReason             String?
+  test                     Boolean
+  /// Shop currency at order time; currency of every amount below.
+  currencyCode             String
+  presentmentCurrencyCode  String
+  /// Display only, never used in a calculation.
+  displayFinancialStatus   String?
+  displayFulfillmentStatus String
+  taxesIncluded            Boolean
+  dutiesIncluded           Boolean
+  /// Shopify Customer GID only (D5). No customer PII is stored anywhere.
+  customerShopifyGid       String?
+  totalWeightGrams         BigInt?
+  /// Soft delete (orders/delete).
+  deletedAt                DateTime? @db.Timestamptz(3)
+
+  // Amounts kept separate from product revenue (D1).
+  totalTipReceived            Decimal  @db.Decimal(20, 6)
+  originalTotalDuties         Decimal? @db.Decimal(20, 6)
+  currentTotalDuties          Decimal? @db.Decimal(20, 6)
+  originalTotalAdditionalFees Decimal? @db.Decimal(20, 6)
+  currentTotalAdditionalFees  Decimal? @db.Decimal(20, 6)
+
+  // Shopify totals, consistency checks only (PG-000 §3.1). Never revenue.
+  subtotalPrice         Decimal @db.Decimal(20, 6)
+  totalPrice            Decimal @db.Decimal(20, 6)
+  currentTotalPrice     Decimal @db.Decimal(20, 6)
+  totalDiscounts        Decimal @db.Decimal(20, 6)
+  currentTotalDiscounts Decimal @db.Decimal(20, 6)
+  totalTax              Decimal @db.Decimal(20, 6)
+  currentTotalTax       Decimal @db.Decimal(20, 6)
+  currentShippingPrice  Decimal @db.Decimal(20, 6)
+  totalReceived         Decimal @db.Decimal(20, 6)
+  netPayment            Decimal @db.Decimal(20, 6)
+  totalRefunded         Decimal @db.Decimal(20, 6)
+  totalRefundedShipping Decimal @db.Decimal(20, 6)
+  totalOutstanding      Decimal @db.Decimal(20, 6)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  shop          Shop               @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  lines         OrderLine[]
+  shippingLines ShippingLine[]
+  transactions  OrderTransaction[]
+  refunds       Refund[]
+
+  @@unique([shopId, shopifyGid])
+  @@unique([shopId, id])
+  @@index([shopId, processedAt])
+  @@index([shopId, shopifyUpdatedAt])
+  @@index([shopId, customerShopifyGid])
+}
+
+/// Historical line. Survives catalog changes: product/variant links are optional
+/// and the Shopify GIDs seen at ingestion are kept.
+model OrderLine {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId             String   @db.Uuid
+  orderId            String   @db.Uuid
+  shopifyGid         String
+  productId          String?  @db.Uuid
+  variantId          String?  @db.Uuid
+  productShopifyGid  String?
+  variantShopifyGid  String?
+  title              String
+  variantTitle       String?
+  sku                String?
+  /// Ordered quantity, including refunded and removed units.
+  quantity           Int
+  currentQuantity    Int
+  refundableQuantity Int
+  originalUnitPrice  Decimal  @db.Decimal(20, 6)
+  originalTotal      Decimal  @db.Decimal(20, 6)
+  currencyCode       String
+  isGiftCard         Boolean
+  createdAt          DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime @updatedAt @db.Timestamptz(3)
+
+  shop                Shop                          @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  order               Order                         @relation(fields: [shopId, orderId], references: [shopId, id], onDelete: Cascade)
+  /// Optional but tenant-safe: composite FK (shopId, productId|variantId). A NULL id skips the check (MATCH SIMPLE).
+  /// NoAction: hard-deleting a referenced product/variant fails; use deletedAt.
+  product             Product?                      @relation(fields: [shopId, productId], references: [shopId, id], onDelete: NoAction)
+  variant             ProductVariant?               @relation(fields: [shopId, variantId], references: [shopId, id], onDelete: NoAction)
+  discountAllocations OrderLineDiscountAllocation[]
+  taxes               OrderLineTax[]
+  refundLines         RefundLine[]
+  costSnapshot        OrderLineCostSnapshot?
+
+  @@unique([shopId, shopifyGid])
+  @@unique([shopId, id])
+  @@index([orderId])
+  @@index([productId])
+  @@index([variantId])
+}
+
+/// No Shopify id: replaced as a block on each refetch.
+model OrderLineDiscountAllocation {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId       String   @db.Uuid
+  orderLineId  String   @db.Uuid
+  position     Int
+  amount       Decimal  @db.Decimal(20, 6)
+  currencyCode String
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+
+  shop      Shop      @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  orderLine OrderLine @relation(fields: [shopId, orderLineId], references: [shopId, id], onDelete: Cascade)
+
+  @@unique([orderLineId, position])
+}
+
+/// No Shopify id: replaced as a block on each refetch.
+/// amount is the source of truth; rate is informational only.
+model OrderLineTax {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId       String   @db.Uuid
+  orderLineId  String   @db.Uuid
+  position     Int
+  title        String?
+  rate         Decimal? @db.Decimal(30, 15)
+  amount       Decimal  @db.Decimal(20, 6)
+  currencyCode String
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+
+  shop      Shop      @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  orderLine OrderLine @relation(fields: [shopId, orderLineId], references: [shopId, id], onDelete: Cascade)
+
+  @@unique([orderLineId, position])
+}
+
+/// Shipping BILLED to the customer. Never the carrier's real cost.
+model ShippingLine {
+  id                     String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId                 String   @db.Uuid
+  orderId                String   @db.Uuid
+  /// Nullable in Shopify. Identity falls back to (orderId, position).
+  shopifyGid             String?
+  position               Int
+  title                  String
+  code                   String?
+  source                 String?
+  carrierIdentifier      String?
+  isRemoved              Boolean
+  originalPrice          Decimal  @db.Decimal(20, 6)
+  /// Already net of shipping discounts.
+  discountedPrice        Decimal  @db.Decimal(20, 6)
+  currentDiscountedPrice Decimal  @db.Decimal(20, 6)
+  currencyCode           String
+  createdAt              DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt              DateTime @updatedAt @db.Timestamptz(3)
+
+  shop  Shop              @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  order Order             @relation(fields: [shopId, orderId], references: [shopId, id], onDelete: Cascade)
+  taxes ShippingLineTax[]
+
+  @@unique([shopId, shopifyGid])
+  @@unique([orderId, position])
+  @@unique([shopId, id])
+}
+
+/// No Shopify id: replaced as a block on each refetch.
+model ShippingLineTax {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId         String   @db.Uuid
+  shippingLineId String   @db.Uuid
+  position       Int
+  title          String?
+  rate           Decimal? @db.Decimal(30, 15)
+  amount         Decimal  @db.Decimal(20, 6)
+  currencyCode   String
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+
+  shop         Shop         @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  shippingLine ShippingLine @relation(fields: [shopId, shippingLineId], references: [shopId, id], onDelete: Cascade)
+
+  @@unique([shippingLineId, position])
+}
+
+/// A transaction moves money only when status = SUCCESS (PG-000 §6).
+/// gateway "shopify_store_credit" = economic refund, not cash (D6).
+model OrderTransaction {
+  id                     String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId                 String    @db.Uuid
+  orderId                String    @db.Uuid
+  /// Set when the transaction belongs to Refund.transactions. Tenant-safe composite FK (shopId, refundId).
+  refundId               String?   @db.Uuid
+  /// Tenant-safe composite FK (shopId, parentTransactionId).
+  parentTransactionId    String?   @db.Uuid
+  shopifyGid             String
+  /// Shopify OrderTransactionKind, stored as String.
+  kind                   String
+  /// Shopify OrderTransactionStatus, stored as String. PENDING is not SUCCESS.
+  status                 String
+  gateway                String?
+  formattedGateway       String?
+  amount                 Decimal   @db.Decimal(20, 6)
+  currencyCode           String
+  settlementCurrency     String?
+  settlementCurrencyRate Decimal?  @db.Decimal(30, 15)
+  /// Accounting date of the money movement (D2), fallback shopifyCreatedAt.
+  processedAt            DateTime? @db.Timestamptz(3)
+  shopifyCreatedAt       DateTime  @db.Timestamptz(3)
+  test                   Boolean
+  errorCode              String?
+  createdAt              DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt              DateTime  @updatedAt @db.Timestamptz(3)
+
+  shop              Shop               @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  order             Order              @relation(fields: [shopId, orderId], references: [shopId, id], onDelete: Cascade)
+  refund            Refund?            @relation(fields: [shopId, refundId], references: [shopId, id], onDelete: NoAction)
+  parentTransaction OrderTransaction?  @relation("TransactionParent", fields: [shopId, parentTransactionId], references: [shopId, id], onDelete: NoAction)
+  childTransactions OrderTransaction[] @relation("TransactionParent")
+  fees              TransactionFee[]
+
+  @@unique([shopId, shopifyGid])
+  @@unique([shopId, id])
+  @@index([orderId])
+  @@index([refundId])
+  @@index([parentTransactionId])
+}
+
+/// Verified Shopify Payments fees only. Third-party gateway fees are never stored here.
+/// No Shopify id: replaced as a block on each refetch.
+model TransactionFee {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId        String   @db.Uuid
+  transactionId String   @db.Uuid
+  position      Int
+  type          String
+  amount        Decimal  @db.Decimal(20, 6)
+  /// Currency of amount, flatFee and taxAmount.
+  currencyCode  String
+  flatFee       Decimal? @db.Decimal(20, 6)
+  flatFeeName   String?
+  rate          Decimal? @db.Decimal(30, 15)
+  rateName      String?
+  taxAmount     Decimal? @db.Decimal(20, 6)
+  createdAt     DateTime @default(now()) @db.Timestamptz(3)
+
+  shop        Shop             @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  transaction OrderTransaction @relation(fields: [shopId, transactionId], references: [shopId, id], onDelete: Cascade)
+
+  @@unique([transactionId, position])
+}
+
+/// A Refund is not a money movement: money is read from its OrderTransaction rows.
+model Refund {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId           String    @db.Uuid
+  orderId          String    @db.Uuid
+  shopifyGid       String
+  shopifyCreatedAt DateTime? @db.Timestamptz(3)
+  shopifyUpdatedAt DateTime  @db.Timestamptz(3)
+  /// Shopify control total: counts only successful transactions. Never cash by itself.
+  totalRefunded    Decimal   @db.Decimal(20, 6)
+  currencyCode     String
+  createdAt        DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime  @updatedAt @db.Timestamptz(3)
+
+  shop          Shop                    @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  order         Order                   @relation(fields: [shopId, orderId], references: [shopId, id], onDelete: Cascade)
+  lines         RefundLine[]
+  shippingLines RefundShippingLine[]
+  adjustments   RefundOrderAdjustment[]
+  transactions  OrderTransaction[]
+
+  @@unique([shopId, shopifyGid])
+  @@unique([shopId, id])
+  @@index([orderId])
+}
+
+/// Identity: shopifyGid when present, else (refundId, position).
+/// No unique on (refundId, orderLineId): a line can legitimately appear in
+/// several refunds, and possibly twice in one refund.
+model RefundLine {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId       String   @db.Uuid
+  refundId     String   @db.Uuid
+  orderLineId  String   @db.Uuid
+  shopifyGid   String?
+  position     Int
+  quantity     Int
+  subtotal     Decimal  @db.Decimal(20, 6)
+  taxAmount    Decimal  @db.Decimal(20, 6)
+  currencyCode String
+  /// Shopify RefundLineItemRestockType (RETURN, CANCEL, NO_RESTOCK...), stored as String.
+  restockType  String
+  restocked    Boolean
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  shop      Shop      @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  refund    Refund    @relation(fields: [shopId, refundId], references: [shopId, id], onDelete: Cascade)
+  orderLine OrderLine @relation(fields: [shopId, orderLineId], references: [shopId, id], onDelete: Cascade)
+
+  @@unique([shopId, shopifyGid])
+  @@unique([refundId, position])
+  @@index([orderLineId])
+}
+
+/// No Shopify id kept: replaced as a block on each refetch.
+model RefundShippingLine {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId         String   @db.Uuid
+  refundId       String   @db.Uuid
+  position       Int
+  subtotalAmount Decimal  @db.Decimal(20, 6)
+  taxAmount      Decimal  @db.Decimal(20, 6)
+  currencyCode   String
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+
+  shop   Shop   @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  refund Refund @relation(fields: [shopId, refundId], references: [shopId, id], onDelete: Cascade)
+
+  @@unique([refundId, position])
+}
+
+/// Never a cash movement by itself (e.g. REFUND_DISCREPANCY).
+/// Replaced as a block on each refetch.
+model RefundOrderAdjustment {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId       String   @db.Uuid
+  refundId     String   @db.Uuid
+  position     Int
+  /// Shopify OrderAdjustmentDiscrepancyReason, stored as String.
+  reason       String
+  amount       Decimal  @db.Decimal(20, 6)
+  taxAmount    Decimal  @db.Decimal(20, 6)
+  currencyCode String
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+
+  shop   Shop   @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  refund Refund @relation(fields: [shopId, refundId], references: [shopId, id], onDelete: Cascade)
+
+  @@unique([refundId, position])
+}
+
+/// Historical COGS reference of an order line (PG-000 §4.2).
+/// Frozen at first ingestion. Never updated from InventoryItem.unitCost.
+/// CHECK constraints (migration SQL): MISSING <=> unitCost NULL; unitCost NULL <=> currencyCode NULL.
+model OrderLineCostSnapshot {
+  id                      String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId                  String     @db.Uuid
+  /// At most one snapshot per order line.
+  orderLineId             String     @unique @db.Uuid
+  inventoryItemShopifyGid String?
+  unitCost                Decimal?   @db.Decimal(20, 6)
+  currencyCode            String?
+  source                  CostSource
+  /// True when the cost is the current cost captured at initial import, not the cost at order time.
+  historicalApproximation Boolean
+  capturedAt              DateTime   @db.Timestamptz(3)
+  createdAt               DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt               DateTime   @updatedAt @db.Timestamptz(3)
+
+  shop      Shop      @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  orderLine OrderLine @relation(fields: [shopId, orderLineId], references: [shopId, id], onDelete: Cascade)
+
+  /// Required by Prisma for a one-to-one relation on a composite FK. UNIQUE(orderLineId) is the business rule.
+  @@unique([shopId, orderLineId])
 }
