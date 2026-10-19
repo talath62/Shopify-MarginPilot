@@ -88,6 +88,7 @@ model Shop {
   refundShippingLines          RefundShippingLine[]
   refundOrderAdjustments       RefundOrderAdjustment[]
   orderLineCostSnapshots       OrderLineCostSnapshot[]
+  jobs                         Job[]
 }
 
 model Product {
@@ -534,4 +535,53 @@ model OrderLineCostSnapshot {
 
   /// Required by Prisma for a one-to-one relation on a composite FK. UNIQUE(orderLineId) is the business rule.
   @@unique([shopId, orderLineId])
+}
+
+// ---------------------------------------------------------------------------
+// PG-009 — Persistent job queue (see docs/PG-009-job-infrastructure.md).
+// ---------------------------------------------------------------------------
+
+enum JobType {
+  ORDER_SYNC
+  ORDER_RECONCILIATION
+  CATALOG_SYNC
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+/// One unit of background work for one shop. Never contains a token or secret.
+model Job {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  shopId      String    @db.Uuid
+  type        JobType
+  /// Validated per type at enqueue and before execution.
+  payload     Json
+  /// Optional: at most one PENDING job per (shopId, type, dedupeKey), enforced at enqueue.
+  dedupeKey   String?
+  status      JobStatus @default(PENDING)
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  /// Not executed before this instant.
+  runAt       DateTime  @default(now()) @db.Timestamptz(3)
+  /// Lease end of a RUNNING job. An expired lease can be claimed again.
+  lockedUntil DateTime? @db.Timestamptz(3)
+  /// Identifies the current lease. Only its holder can finalize the job.
+  lockToken   String?   @db.Uuid
+  /// Truncated, redacted message of the last failure.
+  lastError   String?
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+  finishedAt  DateTime? @db.Timestamptz(3)
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  /// Claim: PENDING due jobs and expired RUNNING leases.
+  @@index([status, runAt])
+  /// Enqueue deduplication and per-shop lookups.
+  @@index([shopId, type, dedupeKey, status])
 }
