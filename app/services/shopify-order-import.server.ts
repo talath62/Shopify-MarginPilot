@@ -156,7 +156,10 @@ export async function importShopifyOrders({
     for (const node of connection.nodes) {
       const gid = requireGid((node as { id?: unknown })?.id, "Order");
       const order = await fetchOrder(admin, gid);
-      const written = await persistOrder(shopId, order);
+      if (order === null) {
+        throw new OrderImportError("INVALID_SHOPIFY_DATA", `order ${gid} not returned`);
+      }
+      const written = await persistOrder(shopId, order, { historicalApproximation: true, skipIfStale: false });
       result.orders += 1;
       result.orderLines += order.lines.length;
       result.snapshotsCreated += written.snapshotsCreated;
@@ -173,7 +176,7 @@ export async function importShopifyOrders({
 
 type Money = { amount: Prisma.Decimal; currencyCode: string };
 
-interface ImportedOrder {
+export interface ImportedOrder {
   shopifyGid: string;
   data: Omit<Prisma.OrderUncheckedCreateInput, "shopId" | "shopifyGid">;
   lines: ImportedLine[];
@@ -274,11 +277,16 @@ interface ImportedRefund {
 
 type Json = Record<string, unknown>;
 
-async function fetchOrder(admin: AdminGraphqlClient, gid: string): Promise<ImportedOrder> {
+/**
+ * Fetches and validates one complete order (all pages). Returns null when
+ * Shopify returns `order: null`. Shared with PG-007.
+ */
+export async function fetchOrder(admin: AdminGraphqlClient, gid: string): Promise<ImportedOrder | null> {
   const data = await runQuery(admin, ORDER_QUERY, { id: gid });
   const raw = data.order as Json | null;
-  if (!raw || typeof raw !== "object") {
-    throw new OrderImportError("INVALID_SHOPIFY_DATA", `order ${gid} not returned`);
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== "object") {
+    throw new OrderImportError("INVALID_SHOPIFY_DATA", `order ${gid}: invalid object`);
   }
 
   // lineItems: first page, then the remaining pages of this order.
@@ -576,9 +584,40 @@ function mapTransaction(raw: Json): ImportedTransaction {
 // Persistence: one DB transaction per order, after all Shopify calls.
 // ---------------------------------------------------------------------------
 
-async function persistOrder(shopId: string, order: ImportedOrder): Promise<{ snapshotsCreated: number }> {
+export interface PersistOrderOptions {
+  /** Value of historicalApproximation for NEW snapshots (true: initial import, false: current sync). */
+  historicalApproximation: boolean;
+  /** Skip the write when Shopify.updatedAt is older than the stored shopifyUpdatedAt. */
+  skipIfStale: boolean;
+}
+
+export type PersistOrderResult =
+  | { status: "synced"; orderId: string; snapshotsCreated: number }
+  | { status: "skipped_stale"; orderId: string; snapshotsCreated: 0 };
+
+/** Writes one validated order and all its children in one DB transaction. Shared with PG-007. */
+export async function persistOrder(
+  shopId: string,
+  order: ImportedOrder,
+  options: PersistOrderOptions,
+): Promise<PersistOrderResult> {
   return prisma.$transaction(
-    async (tx) => {
+    async (tx): Promise<PersistOrderResult> => {
+      // Serializes concurrent writes of the same order, even before the order
+      // row exists. Transaction-scoped advisory lock: released at commit/rollback.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`order:${shopId}:${order.shopifyGid}`}, 0))`;
+
+      // The staleness check runs after the lock, so it sees the latest committed write.
+      if (options.skipIfStale) {
+        const stored = await tx.order.findUnique({
+          where: { shopId_shopifyGid: { shopId, shopifyGid: order.shopifyGid } },
+          select: { id: true, shopifyUpdatedAt: true },
+        });
+        if (stored !== null && (order.data.shopifyUpdatedAt as Date) < stored.shopifyUpdatedAt) {
+          return { status: "skipped_stale", orderId: stored.id, snapshotsCreated: 0 };
+        }
+      }
+
       const { id: orderId } = await tx.order.upsert({
         where: { shopId_shopifyGid: { shopId, shopifyGid: order.shopifyGid } },
         create: { shopId, shopifyGid: order.shopifyGid, ...order.data },
@@ -636,7 +675,8 @@ async function persistOrder(shopId: string, order: ImportedOrder): Promise<{ sna
           data: line.taxes.map((tax, position) => ({ shopId, orderLineId: saved.id, position, ...tax })),
         });
 
-        if (await createSnapshotIfAbsent(tx, shopId, saved.id, line, variant?.inventoryItem ?? null)) {
+        const inventoryItem = variant?.inventoryItem ?? null;
+        if (await createSnapshotIfAbsent(tx, shopId, saved.id, line, inventoryItem, options.historicalApproximation)) {
           snapshotsCreated += 1;
         }
       }
@@ -733,7 +773,7 @@ async function persistOrder(shopId: string, order: ImportedOrder): Promise<{ sna
         }
       }
 
-      return { snapshotsCreated };
+      return { status: "synced", orderId, snapshotsCreated };
     },
     { timeout: 30_000 },
   );
@@ -741,7 +781,8 @@ async function persistOrder(shopId: string, order: ImportedOrder): Promise<{ sna
 
 /**
  * Creates the COGS snapshot of a line ONLY if none exists. Never updates it.
- * Initial import of past orders: the current cost is an historical approximation.
+ * historicalApproximation: true for the initial import of past orders (PG-006),
+ * false for the current sync of an order (PG-007).
  */
 async function createSnapshotIfAbsent(
   tx: Prisma.TransactionClient,
@@ -749,6 +790,7 @@ async function createSnapshotIfAbsent(
   orderLineId: string,
   line: ImportedLine,
   inventoryItem: { shopifyGid: string; unitCost: Prisma.Decimal | null; unitCostCurrencyCode: string | null } | null,
+  historicalApproximation: boolean,
 ): Promise<boolean> {
   const existing = await tx.orderLineCostSnapshot.findUnique({ where: { orderLineId }, select: { id: true } });
   if (existing !== null) return false;
@@ -762,7 +804,7 @@ async function createSnapshotIfAbsent(
       unitCost: known ? inventoryItem.unitCost : null,
       currencyCode: known ? inventoryItem.unitCostCurrencyCode : null,
       source: known ? "SHOPIFY_UNIT_COST" : "MISSING",
-      historicalApproximation: true,
+      historicalApproximation,
       capturedAt: new Date(),
     },
   });
