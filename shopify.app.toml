@@ -21,6 +21,19 @@ api_version = "2026-10"
   uri = "/webhooks/app/scopes_update"
   topics = [ "app/scopes_update" ]
 
+  # PG-010 : commandes et catalogue -> jobs PG-009 (app/routes/webhooks.marginpilot.tsx).
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/marginpilot"
+  topics = [
+    "orders/create",
+    "orders/updated",
+    "refunds/create",
+    "products/create",
+    "products/update",
+    "products/delete",
+    "inventory_items/update"
+  ]
+
 [auth]
 redirect_urls = [ "https://example.com/api/auth" ]
 
